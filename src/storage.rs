@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use redb::{Database, ReadableTable};
+use redb::{Database, ReadableDatabase, ReadableTable};
 use tracing::debug;
 
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
@@ -92,12 +92,18 @@ impl RedbAVLStorage {
         let meta = read_txn.open_table(META_TABLE)?;
 
         let current_version = match meta.get(META_CURRENT_VERSION)? {
-            Some(v) => Some(Bytes::copy_from_slice(v.value())),
+            Some(v) => {
+                let bytes: &[u8] = v.value();
+                Some(Bytes::copy_from_slice(bytes))
+            }
             None => return Ok((None, VecDeque::new())),
         };
 
         let version_chain = match meta.get(META_VERSIONS)? {
-            Some(chain_data) => Self::deserialize_version_chain(chain_data.value())?,
+            Some(chain_data) => {
+                let bytes: &[u8] = chain_data.value();
+                Self::deserialize_version_chain(bytes)?
+            }
             None => VecDeque::new(),
         };
 
@@ -135,9 +141,10 @@ impl RedbAVLStorage {
             };
             match table.get(digest.as_slice()) {
                 Ok(Some(data)) => {
+                    let bytes: &[u8] = data.value();
                     let dummy: Resolver = Arc::new(|_| panic!("resolver called during unpack"));
                     let tree = AVLTree::new(dummy, key_length, value_length);
-                    let node_id = tree.unpack(&Bytes::copy_from_slice(data.value()));
+                    let node_id = tree.unpack(&Bytes::copy_from_slice(bytes));
                     let node = node_id.borrow().clone();
                     node
                 }
@@ -151,7 +158,10 @@ impl RedbAVLStorage {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(NODES_TABLE)?;
         match table.get(label.as_slice())? {
-            Some(data) => Ok(Some(Bytes::copy_from_slice(data.value()))),
+            Some(data) => {
+                let bytes: &[u8] = data.value();
+                Ok(Some(Bytes::copy_from_slice(bytes)))
+            }
             None => Ok(None),
         }
     }
@@ -162,13 +172,15 @@ impl RedbAVLStorage {
         let meta = read_txn.open_table(META_TABLE).ok()?;
 
         let hash_guard = meta.get(META_TOP_NODE_HASH).ok()??;
+        let hash_bytes: &[u8] = hash_guard.value();
         let mut hash: Digest32 = [0u8; 32];
-        hash.copy_from_slice(hash_guard.value());
+        hash.copy_from_slice(hash_bytes);
         drop(hash_guard);
 
         let height_guard = meta.get(META_TOP_NODE_HEIGHT).ok()??;
+        let height_bytes: &[u8] = height_guard.value();
         let height = u32::from_be_bytes(
-            height_guard.value().try_into().ok()?,
+            height_bytes.try_into().ok()?,
         ) as usize;
 
         Some((hash, height))
@@ -326,8 +338,9 @@ impl SnapshotReader {
         // Read root hash from metadata.
         let root_hash: [u8; 32] = match meta_table.get(META_TOP_NODE_HASH)? {
             Some(v) => {
+                let bytes: &[u8] = v.value();
                 let mut h = [0u8; 32];
-                h.copy_from_slice(v.value());
+                h.copy_from_slice(bytes);
                 h
             }
             None => return Ok(None),
@@ -336,7 +349,8 @@ impl SnapshotReader {
         // Read tree height from metadata.
         let tree_height = match meta_table.get(META_TOP_NODE_HEIGHT)? {
             Some(v) => {
-                let h = u32::from_be_bytes(v.value().try_into().context("bad height bytes")?);
+                let bytes: &[u8] = v.value();
+                let h = u32::from_be_bytes(bytes.try_into().context("bad height bytes")?);
                 h as u8
             }
             None => return Ok(None),
