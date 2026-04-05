@@ -411,16 +411,27 @@ impl VersionedAVLStorage for RedbAVLStorage {
     }
 
     fn rollback(&mut self, version: &ADDigest) -> Result<(NodeId, usize)> {
+        // Short-circuit: if target equals current version, just return the
+        // current root.  PersistentBatchAVLProver::new() does this after
+        // load_snapshot() sets a single version.
+        if self.current_version.as_ref() == Some(version) {
+            let (root_hash, height) = self
+                .root_state()
+                .context("no root state for current version")?;
+            let node_bytes = self
+                .get_node(&root_hash)?
+                .context("root node not found in storage")?;
+            let tree = self.make_tree();
+            let root_node = tree.unpack(&node_bytes);
+            return Ok((root_node, height));
+        }
+
         // Find target in the version chain.
         let target_pos = self
             .version_chain
             .iter()
             .position(|(_, d)| d == version)
             .context("version not found in rollback targets")?;
-
-        if target_pos == 0 {
-            bail!("cannot rollback to the current version");
-        }
 
         let write_txn = self.db.begin_write()?;
         let mut last_undo: Option<UndoRecord> = None;
