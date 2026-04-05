@@ -24,6 +24,25 @@ pub struct AVLTreeParams {
     pub value_length: Option<usize>,
 }
 
+/// Lightweight read-only handle for snapshot operations.
+/// Shares the underlying redb `Database` with `RedbAVLStorage` via `Arc`.
+pub struct SnapshotReader {
+    db: Arc<Database>,
+    key_length: usize,
+}
+
+/// A serialized snapshot of the AVL+ tree, split into manifest and chunks.
+pub struct SnapshotDump {
+    /// Root node hash (32 bytes).
+    pub root_hash: [u8; 32],
+    /// AVL+ tree height (from metadata).
+    pub tree_height: u8,
+    /// Serialized manifest: 2-byte header + DFS node bytes down to `manifest_depth`.
+    pub manifest: Vec<u8>,
+    /// Serialized subtree chunks: (subtree_root_label, DFS node bytes).
+    pub chunks: Vec<([u8; 32], Vec<u8>)>,
+}
+
 /// Persistent, versioned, crash-safe AVL+ authenticated dictionary over redb.
 pub struct RedbAVLStorage {
     db: Arc<Database>,
@@ -88,6 +107,15 @@ impl RedbAVLStorage {
     /// Update keep_versions at runtime (e.g. switching from initial sync to normal).
     pub fn set_keep_versions(&mut self, keep_versions: u32) {
         self.keep_versions = keep_versions;
+    }
+
+    /// Create a read-only snapshot reader that shares the database handle.
+    /// Call this BEFORE handing the storage to PersistentBatchAVLProver.
+    pub fn snapshot_reader(&self) -> SnapshotReader {
+        SnapshotReader {
+            db: Arc::clone(&self.db),
+            key_length: self.tree_params.key_length,
+        }
     }
 
     /// Create a Resolver closure that reads nodes from storage on demand.
@@ -277,6 +305,154 @@ impl RedbAVLStorage {
         self.version_chain = VecDeque::from([(1, version)]);
 
         Ok(())
+    }
+}
+
+// ── SnapshotReader ───────────────────────────────────────────────────
+
+impl SnapshotReader {
+    /// Dump the AVL+ tree as a snapshot manifest + chunks.
+    ///
+    /// Opens a single read transaction for consistency. Walks the tree in
+    /// pre-order DFS, serializing nodes into manifest bytes (root to
+    /// `manifest_depth`) and chunk bytes (each subtree below the boundary).
+    ///
+    /// Returns `None` if the tree is empty (no root state).
+    pub fn dump_snapshot(&self, manifest_depth: u8) -> Result<Option<SnapshotDump>> {
+        let read_txn = self.db.begin_read()?;
+        let nodes_table = read_txn.open_table(NODES_TABLE)?;
+        let meta_table = read_txn.open_table(META_TABLE)?;
+
+        // Read root hash from metadata.
+        let root_hash: [u8; 32] = match meta_table.get(META_TOP_NODE_HASH)? {
+            Some(v) => {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(v.value());
+                h
+            }
+            None => return Ok(None),
+        };
+
+        // Read tree height from metadata.
+        let tree_height = match meta_table.get(META_TOP_NODE_HEIGHT)? {
+            Some(v) => {
+                let h = u32::from_be_bytes(v.value().try_into().context("bad height bytes")?);
+                h as u8
+            }
+            None => return Ok(None),
+        };
+
+        // Manifest header: [tree_height, manifest_depth].
+        let mut manifest = Vec::new();
+        manifest.push(tree_height);
+        manifest.push(manifest_depth);
+
+        // Collect subtree root labels at the manifest boundary.
+        let mut subtree_roots: Vec<[u8; 32]> = Vec::new();
+
+        // Pre-order DFS for manifest — level starts at 1 (JVM convention).
+        self.walk_manifest(
+            &nodes_table,
+            &root_hash,
+            1,
+            manifest_depth,
+            &mut manifest,
+            &mut subtree_roots,
+        )?;
+
+        // Serialize chunks: full DFS from each subtree root.
+        let mut chunks = Vec::with_capacity(subtree_roots.len());
+        for subtree_label in &subtree_roots {
+            let mut chunk_buf = Vec::new();
+            self.walk_chunk(&nodes_table, subtree_label, &mut chunk_buf)?;
+            chunks.push((*subtree_label, chunk_buf));
+        }
+
+        Ok(Some(SnapshotDump {
+            root_hash,
+            tree_height,
+            manifest,
+            chunks,
+        }))
+    }
+
+    /// Recursive manifest DFS. Appends packed bytes to `manifest`.
+    /// At boundary depth, records child labels as subtree roots.
+    fn walk_manifest(
+        &self,
+        table: &redb::ReadOnlyTable<&[u8], &[u8]>,
+        label: &[u8; 32],
+        level: u8,
+        manifest_depth: u8,
+        manifest: &mut Vec<u8>,
+        subtree_roots: &mut Vec<[u8; 32]>,
+    ) -> Result<()> {
+        let packed = table
+            .get(label.as_slice())?
+            .with_context(|| format!("manifest: node {} not found", format!("{:02x?}", label)))?;
+        let packed_bytes = packed.value();
+        manifest.extend_from_slice(packed_bytes);
+
+        let node_type = packed_bytes[0];
+
+        // Leaf (0x01): no children, stop.
+        if node_type == 0x01 {
+            return Ok(());
+        }
+
+        // Internal (0x00): extract child labels.
+        debug_assert_eq!(node_type, 0x00, "unexpected node type byte");
+        let (left_label, right_label) = self.extract_child_labels(packed_bytes);
+
+        if level == manifest_depth {
+            // Boundary: record children as subtree roots, don't recurse.
+            subtree_roots.push(left_label);
+            subtree_roots.push(right_label);
+        } else {
+            // level < manifest_depth: recurse.
+            self.walk_manifest(table, &left_label, level + 1, manifest_depth, manifest, subtree_roots)?;
+            self.walk_manifest(table, &right_label, level + 1, manifest_depth, manifest, subtree_roots)?;
+        }
+
+        Ok(())
+    }
+
+    /// Recursive chunk DFS. Walks the full subtree to all leaves.
+    fn walk_chunk(
+        &self,
+        table: &redb::ReadOnlyTable<&[u8], &[u8]>,
+        label: &[u8; 32],
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        let packed = table
+            .get(label.as_slice())?
+            .with_context(|| format!("chunk: node {} not found", format!("{:02x?}", label)))?;
+        let packed_bytes = packed.value();
+        buf.extend_from_slice(packed_bytes);
+
+        let node_type = packed_bytes[0];
+
+        // Leaf: stop.
+        if node_type == 0x01 {
+            return Ok(());
+        }
+
+        // Internal: recurse into children.
+        let (left_label, right_label) = self.extract_child_labels(packed_bytes);
+        drop(packed);
+        self.walk_chunk(table, &left_label, buf)?;
+        self.walk_chunk(table, &right_label, buf)
+    }
+
+    /// Extract left and right child labels from an internal node's packed bytes.
+    /// Format: 0x00 | balance: i8 | key: key_length | left_label: 32B | right_label: 32B
+    fn extract_child_labels(&self, packed: &[u8]) -> ([u8; 32], [u8; 32]) {
+        let offset = 2 + self.key_length; // skip type byte + balance byte + key
+        let mut left = [0u8; 32];
+        let mut right = [0u8; 32];
+        left.copy_from_slice(&packed[offset..offset + 32]);
+        right.copy_from_slice(&packed[offset + 32..offset + 64]);
+        (left, right)
     }
 }
 

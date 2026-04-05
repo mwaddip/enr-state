@@ -1,9 +1,10 @@
+use blake2::Digest;
 use bytes::Bytes;
-use enr_state::{AVLTreeParams, RedbAVLStorage};
+use enr_state::{AVLTreeParams, RedbAVLStorage, SnapshotReader};
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
-use ergo_avltree_rust::batch_node::AVLTree;
-use ergo_avltree_rust::operation::{KeyValue, Operation};
+use ergo_avltree_rust::batch_node::{AVLTree, Blake2b256};
+use ergo_avltree_rust::operation::{Digest32, KeyValue, Operation};
 use ergo_avltree_rust::versioned_avl_storage::VersionedAVLStorage;
 use tempfile::tempdir;
 
@@ -392,4 +393,190 @@ fn reopen_preserves_rollback_chain() {
     tree.height = height;
     let prover = BatchAVLProver::new(tree, false);
     assert_eq!(prover.digest().unwrap(), d1);
+}
+
+// ── Snapshot dump ────────────────────────────────────────────────────
+
+/// Compute a node label from its packed bytes, matching ergo_avltree_rust convention.
+/// Internal: Blake2b256(0x01 || balance || left_label || right_label)
+/// Leaf:     Blake2b256(0x00 || key || value || next_key)
+fn label_from_packed(packed: &[u8], key_length: usize) -> Digest32 {
+    let node_type = packed[0];
+    let mut hasher = Blake2b256::new();
+    if node_type == 0x00 {
+        // Internal: pack uses 0x00, but label hash uses prefix 0x01
+        hasher.update(&[1u8]);
+        let balance = packed[1];
+        hasher.update(&[balance]);
+        let left_offset = 2 + key_length;
+        hasher.update(&packed[left_offset..left_offset + 32]);
+        hasher.update(&packed[left_offset + 32..left_offset + 64]);
+    } else {
+        // Leaf: pack uses 0x01, but label hash uses prefix 0x00
+        hasher.update(&[0u8]);
+        // key
+        hasher.update(&packed[1..1 + key_length]);
+        // value_len (BE u32) + value
+        let vlen_offset = 1 + key_length;
+        let value_len =
+            u32::from_be_bytes(packed[vlen_offset..vlen_offset + 4].try_into().unwrap()) as usize;
+        let value_start = vlen_offset + 4;
+        hasher.update(&packed[value_start..value_start + value_len]);
+        // next_leaf_key
+        let next_key_offset = value_start + value_len;
+        hasher.update(&packed[next_key_offset..next_key_offset + key_length]);
+    }
+    let mut label: Digest32 = [0u8; 32];
+    label.copy_from_slice(&hasher.finalize());
+    label
+}
+
+/// Parse a DFS byte stream into (label, packed_bytes) pairs.
+fn parse_dfs_nodes(data: &[u8], key_length: usize) -> Vec<(Digest32, Vec<u8>)> {
+    let mut nodes = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let node_type = data[pos];
+        let node_len = if node_type == 0x00 {
+            // Internal: type(1) + balance(1) + key(key_length) + left(32) + right(32)
+            1 + 1 + key_length + 32 + 32
+        } else {
+            // Leaf: type(1) + key(key_length) + value_len(4) + value + next_key(key_length)
+            let vlen_offset = pos + 1 + key_length;
+            let value_len =
+                u32::from_be_bytes(data[vlen_offset..vlen_offset + 4].try_into().unwrap())
+                    as usize;
+            1 + key_length + 4 + value_len + key_length
+        };
+
+        let packed = &data[pos..pos + node_len];
+        let label = label_from_packed(packed, key_length);
+        nodes.push((label, packed.to_vec()));
+        pos += node_len;
+    }
+    nodes
+}
+
+#[test]
+fn dump_snapshot_round_trip() {
+    // 1. Create storage + reader + prover.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("state.redb");
+    let mut storage = RedbAVLStorage::open(&path, params(), 10).unwrap();
+
+    let reader: SnapshotReader = storage.snapshot_reader();
+
+    let resolver = storage.resolver();
+    let tree = AVLTree::new(resolver, KEY_LEN, None);
+    let mut prover = BatchAVLProver::new(tree, true);
+
+    // 2. Insert 100 keys.
+    for i in 0u8..100 {
+        let mut key = vec![0u8; KEY_LEN];
+        key[0] = 0x01;
+        key[1] = i / 10 + 1;
+        key[2] = i % 10;
+        let value = vec![i; 64];
+        prover
+            .perform_one_operation(&Operation::Insert(KeyValue {
+                key: Bytes::from(key),
+                value: Bytes::from(value),
+            }))
+            .unwrap();
+    }
+
+    // 3. Commit.
+    storage.update(&mut prover, vec![]).unwrap();
+    prover.base.tree.reset();
+    prover.base.changed_nodes_buffer.clear();
+    prover.base.changed_nodes_buffer_to_check.clear();
+
+    let expected_root = prover.base.tree.label(&prover.top_node());
+    let expected_height = prover.base.tree.height;
+
+    // 4. Dump snapshot at depth 3.
+    let snap = reader.dump_snapshot(3).unwrap().expect("tree not empty");
+
+    // 5. Verify metadata.
+    assert_eq!(snap.root_hash, expected_root, "root hash mismatch");
+    assert_eq!(snap.tree_height, expected_height as u8, "tree height mismatch");
+
+    // 6. Verify manifest header.
+    assert_eq!(snap.manifest[0], expected_height as u8);
+    assert_eq!(snap.manifest[1], 3); // manifest_depth
+
+    // 7. Verify manifest bytes are parseable (skip 2-byte header).
+    let manifest_nodes = parse_dfs_nodes(&snap.manifest[2..], KEY_LEN);
+    assert!(!manifest_nodes.is_empty(), "manifest has no nodes");
+
+    // First node's label should be the root hash.
+    assert_eq!(manifest_nodes[0].0, expected_root, "first manifest node is not root");
+
+    // 8. Verify chunks are non-empty.
+    assert!(!snap.chunks.is_empty(), "no chunks produced");
+
+    // 9. Collect boundary subtree labels from the manifest.
+    let mut boundary_labels: Vec<[u8; 32]> = Vec::new();
+    for (_, packed) in &manifest_nodes {
+        if packed[0] == 0x00 {
+            // Check if this internal node's children are NOT in the manifest.
+            // Boundary nodes are those whose children appear as chunk roots.
+            let offset = 2 + KEY_LEN;
+            let mut left = [0u8; 32];
+            let mut right = [0u8; 32];
+            left.copy_from_slice(&packed[offset..offset + 32]);
+            right.copy_from_slice(&packed[offset + 32..offset + 64]);
+
+            let left_in_manifest = manifest_nodes.iter().any(|(l, _)| *l == left);
+            let right_in_manifest = manifest_nodes.iter().any(|(l, _)| *l == right);
+
+            if !left_in_manifest {
+                boundary_labels.push(left);
+            }
+            if !right_in_manifest {
+                boundary_labels.push(right);
+            }
+        }
+    }
+
+    // Every chunk root label should be in boundary_labels.
+    for (chunk_label, _) in &snap.chunks {
+        assert!(
+            boundary_labels.contains(chunk_label),
+            "chunk root not found in manifest boundary"
+        );
+    }
+
+    // 10. Round-trip: load into a second storage and verify root_state matches.
+    let dir2 = tempdir().unwrap();
+    let path2 = dir2.path().join("state2.redb");
+    let mut storage2 = RedbAVLStorage::open(&path2, params(), 10).unwrap();
+
+    // Collect all nodes from manifest + chunks.
+    let mut all_nodes: Vec<(Digest32, Bytes)> = manifest_nodes
+        .iter()
+        .map(|(l, p)| (*l, Bytes::from(p.clone())))
+        .collect();
+
+    for (_, chunk_bytes) in &snap.chunks {
+        let chunk_nodes = parse_dfs_nodes(chunk_bytes, KEY_LEN);
+        for (l, p) in chunk_nodes {
+            all_nodes.push((l, Bytes::from(p)));
+        }
+    }
+
+    let version = prover.digest().unwrap();
+    storage2
+        .load_snapshot(
+            all_nodes.into_iter(),
+            snap.root_hash,
+            snap.tree_height as usize,
+            version,
+        )
+        .unwrap();
+
+    // Verify the second storage has the same root state.
+    let (root2, height2) = storage2.root_state().expect("no root state after load");
+    assert_eq!(root2, snap.root_hash, "loaded root hash mismatch");
+    assert_eq!(height2, snap.tree_height as usize, "loaded height mismatch");
 }
