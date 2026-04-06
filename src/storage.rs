@@ -26,6 +26,7 @@ pub struct AVLTreeParams {
 
 /// Lightweight read-only handle for snapshot operations.
 /// Shares the underlying redb `Database` with `RedbAVLStorage` via `Arc`.
+#[derive(Clone)]
 pub struct SnapshotReader {
     db: Arc<Database>,
     key_length: usize,
@@ -456,6 +457,56 @@ impl SnapshotReader {
         drop(packed);
         self.walk_chunk(table, &left_label, buf)?;
         self.walk_chunk(table, &right_label, buf)
+    }
+
+    /// Look up a key in the AVL+ tree, returning the value bytes if found.
+    ///
+    /// Navigates from root to leaf by comparing keys at internal nodes.
+    /// Read-only — no tree modification.
+    pub fn lookup_key(&self, key: &[u8; 32]) -> Option<Vec<u8>> {
+        let read_txn = self.db.begin_read().ok()?;
+        let nodes_table = read_txn.open_table(NODES_TABLE).ok()?;
+        let meta_table = read_txn.open_table(META_TABLE).ok()?;
+
+        // Get root label
+        let root_guard = meta_table.get(META_TOP_NODE_HASH).ok()??;
+        let root_bytes: &[u8] = root_guard.value();
+        let mut current_label = [0u8; 32];
+        current_label.copy_from_slice(root_bytes);
+        drop(root_guard);
+
+        loop {
+            let packed_guard = nodes_table.get(current_label.as_slice()).ok()??;
+            let packed = packed_guard.value();
+            let node_type = packed[0];
+
+            if node_type == 0x01 {
+                // Leaf: key starts at byte 1
+                let leaf_key = &packed[1..1 + self.key_length];
+                if leaf_key == key.as_slice() {
+                    // value_length is u32 BE (variable-length mode)
+                    let vlen_offset = 1 + self.key_length;
+                    let vlen = u32::from_be_bytes(
+                        packed[vlen_offset..vlen_offset + 4].try_into().ok()?,
+                    ) as usize;
+                    let value = packed[vlen_offset + 4..vlen_offset + 4 + vlen].to_vec();
+                    return Some(value);
+                }
+                return None;
+            }
+
+            // Internal: key at bytes [2..2+key_length], children after
+            let node_key = &packed[2..2 + self.key_length];
+            let child_offset = 2 + self.key_length;
+            if key.as_slice() < node_key {
+                // Go left
+                current_label.copy_from_slice(&packed[child_offset..child_offset + 32]);
+            } else {
+                // Go right (key >= node_key)
+                current_label.copy_from_slice(&packed[child_offset + 32..child_offset + 64]);
+            }
+            drop(packed_guard);
+        }
     }
 
     /// Extract left and right child labels from an internal node's packed bytes.
