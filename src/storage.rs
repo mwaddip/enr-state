@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use redb::{Database, ReadableDatabase, ReadableTable};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
@@ -417,7 +417,7 @@ impl SnapshotReader {
 
         // Internal (0x00): extract child labels.
         debug_assert_eq!(node_type, 0x00, "unexpected node type byte");
-        let (left_label, right_label) = self.extract_child_labels(packed_bytes);
+        let (left_label, right_label) = self.extract_child_labels(packed_bytes)?;
 
         if level == manifest_depth {
             // Boundary: record children as subtree roots, don't recurse.
@@ -453,7 +453,7 @@ impl SnapshotReader {
         }
 
         // Internal: recurse into children.
-        let (left_label, right_label) = self.extract_child_labels(packed_bytes);
+        let (left_label, right_label) = self.extract_child_labels(packed_bytes)?;
         drop(packed);
         self.walk_chunk(table, &left_label, buf)?;
         self.walk_chunk(table, &right_label, buf)
@@ -478,17 +478,34 @@ impl SnapshotReader {
         loop {
             let packed_guard = nodes_table.get(current_label.as_slice()).ok()??;
             let packed = packed_guard.value();
+            if packed.is_empty() {
+                warn!("corrupt node: empty packed data");
+                return None;
+            }
             let node_type = packed[0];
 
             if node_type == 0x01 {
                 // Leaf: key starts at byte 1
-                let leaf_key = &packed[1..1 + self.key_length];
+                let leaf_end = 1 + self.key_length;
+                if packed.len() < leaf_end {
+                    warn!("corrupt leaf node: truncated key");
+                    return None;
+                }
+                let leaf_key = &packed[1..leaf_end];
                 if leaf_key == key.as_slice() {
                     // value_length is u32 BE (variable-length mode)
-                    let vlen_offset = 1 + self.key_length;
+                    let vlen_offset = leaf_end;
+                    if packed.len() < vlen_offset + 4 {
+                        warn!("corrupt leaf node: truncated value length");
+                        return None;
+                    }
                     let vlen = u32::from_be_bytes(
                         packed[vlen_offset..vlen_offset + 4].try_into().ok()?,
                     ) as usize;
+                    if packed.len() < vlen_offset + 4 + vlen {
+                        warn!("corrupt leaf node: truncated value");
+                        return None;
+                    }
                     let value = packed[vlen_offset + 4..vlen_offset + 4 + vlen].to_vec();
                     return Some(value);
                 }
@@ -496,8 +513,12 @@ impl SnapshotReader {
             }
 
             // Internal: key at bytes [2..2+key_length], children after
-            let node_key = &packed[2..2 + self.key_length];
             let child_offset = 2 + self.key_length;
+            if packed.len() < child_offset + 64 {
+                warn!("corrupt internal node: truncated child labels");
+                return None;
+            }
+            let node_key = &packed[2..child_offset];
             if key.as_slice() < node_key {
                 // Go left
                 current_label.copy_from_slice(&packed[child_offset..child_offset + 32]);
@@ -511,13 +532,21 @@ impl SnapshotReader {
 
     /// Extract left and right child labels from an internal node's packed bytes.
     /// Format: 0x00 | balance: i8 | key: key_length | left_label: 32B | right_label: 32B
-    fn extract_child_labels(&self, packed: &[u8]) -> ([u8; 32], [u8; 32]) {
+    fn extract_child_labels(&self, packed: &[u8]) -> Result<([u8; 32], [u8; 32])> {
         let offset = 2 + self.key_length; // skip type byte + balance byte + key
+        let required = offset + 64;
+        if packed.len() < required {
+            bail!(
+                "corrupt internal node: need {} bytes, got {}",
+                required,
+                packed.len()
+            );
+        }
         let mut left = [0u8; 32];
         let mut right = [0u8; 32];
         left.copy_from_slice(&packed[offset..offset + 32]);
         right.copy_from_slice(&packed[offset + 32..offset + 64]);
-        (left, right)
+        Ok((left, right))
     }
 }
 
@@ -595,7 +624,11 @@ impl VersionedAVLStorage for RedbAVLStorage {
                     None => [0u8; 32],
                 };
                 let prev_top_node_height = match meta_table.get(META_TOP_NODE_HEIGHT)? {
-                    Some(v) => u32::from_be_bytes(v.value().try_into().unwrap_or([0; 4])),
+                    Some(v) => u32::from_be_bytes(
+                        v.value()
+                            .try_into()
+                            .context("corrupt META_TOP_NODE_HEIGHT: expected 4 bytes")?,
+                    ),
                     None => 0,
                 };
                 let prev_version = self.current_version.clone().unwrap_or_default();
