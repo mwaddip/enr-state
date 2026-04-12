@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use redb::{Database, ReadableDatabase, ReadableTable};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable};
 use tracing::{debug, warn};
 
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
@@ -57,7 +57,10 @@ pub struct RedbAVLStorage {
 impl RedbAVLStorage {
     /// Open or create state storage at `path`.
     pub fn open(path: &Path, tree_params: AVLTreeParams, keep_versions: u32) -> Result<Self> {
-        let db = Database::create(path).context("failed to create/open redb")?;
+        let db = Database::builder()
+            .set_cache_size(256 * 1024 * 1024)
+            .create(path)
+            .context("failed to create/open redb")?;
 
         // Ensure tables exist.
         {
@@ -594,7 +597,10 @@ impl VersionedAVLStorage for RedbAVLStorage {
         }
 
         // 5. Single write transaction — atomic or nothing.
-        let write_txn = self.db.begin_write()?;
+        //    Skip fsync per commit — the OS page cache batches writes.
+        //    On crash the sync layer re-applies missing blocks.
+        let mut write_txn = self.db.begin_write()?;
+        write_txn.set_durability(Durability::None)?;
         {
             let mut nodes_table = write_txn.open_table(NODES_TABLE)?;
             let mut meta_table = write_txn.open_table(META_TABLE)?;
