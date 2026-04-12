@@ -1,6 +1,6 @@
 use blake2::Digest;
 use bytes::Bytes;
-use enr_state::{AVLTreeParams, RedbAVLStorage, SnapshotReader};
+use enr_state::{AVLTreeParams, CacheSize, RedbAVLStorage, SnapshotReader};
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
 use ergo_avltree_rust::batch_node::{AVLTree, Blake2b256};
@@ -34,7 +34,7 @@ fn make_value(seed: u8, len: usize) -> Bytes {
 fn setup(keep_versions: u32) -> (RedbAVLStorage, BatchAVLProver, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
-    let mut storage = RedbAVLStorage::open(&path, params(), keep_versions).unwrap();
+    let mut storage = RedbAVLStorage::open(&path, params(), keep_versions, CacheSize::default()).unwrap();
 
     let resolver = storage.resolver();
     let tree = AVLTree::new(resolver, KEY_LEN, None);
@@ -278,7 +278,7 @@ fn keep_versions_prunes_old() {
 fn load_snapshot_sets_state() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
-    let mut storage = RedbAVLStorage::open(&path, params(), 10).unwrap();
+    let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
 
     // Build a small tree to extract its nodes.
     let resolver = storage.resolver();
@@ -320,7 +320,7 @@ fn reopen_preserves_state() {
 
     let original_version;
     {
-        let mut storage = RedbAVLStorage::open(&path, params(), 10).unwrap();
+        let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
         let tree = AVLTree::new(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
@@ -336,7 +336,7 @@ fn reopen_preserves_state() {
     }
 
     // Reopen.
-    let storage = RedbAVLStorage::open(&path, params(), 10).unwrap();
+    let storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
     assert_eq!(storage.version().unwrap(), original_version);
 }
 
@@ -347,7 +347,7 @@ fn reopen_preserves_rollback_chain() {
 
     let d1;
     {
-        let mut storage = RedbAVLStorage::open(&path, params(), 10).unwrap();
+        let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
         let resolver = storage.resolver();
         let tree = AVLTree::new(resolver, KEY_LEN, None);
         let mut prover = BatchAVLProver::new(tree, true);
@@ -377,7 +377,7 @@ fn reopen_preserves_rollback_chain() {
     }
 
     // Reopen and verify we can still rollback.
-    let mut storage = RedbAVLStorage::open(&path, params(), 10).unwrap();
+    let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
     let targets: Vec<_> = storage.rollback_versions().collect();
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0], d1);
@@ -462,7 +462,7 @@ fn dump_snapshot_round_trip() {
     // 1. Create storage + reader + prover.
     let dir = tempdir().unwrap();
     let path = dir.path().join("state.redb");
-    let mut storage = RedbAVLStorage::open(&path, params(), 10).unwrap();
+    let mut storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
 
     let reader: SnapshotReader = storage.snapshot_reader();
 
@@ -550,7 +550,7 @@ fn dump_snapshot_round_trip() {
     // 10. Round-trip: load into a second storage and verify root_state matches.
     let dir2 = tempdir().unwrap();
     let path2 = dir2.path().join("state2.redb");
-    let mut storage2 = RedbAVLStorage::open(&path2, params(), 10).unwrap();
+    let mut storage2 = RedbAVLStorage::open(&path2, params(), 10, CacheSize::default()).unwrap();
 
     // Collect all nodes from manifest + chunks.
     let mut all_nodes: Vec<(Digest32, Bytes)> = manifest_nodes
@@ -579,4 +579,27 @@ fn dump_snapshot_round_trip() {
     let (root2, height2) = storage2.root_state().expect("no root state after load");
     assert_eq!(root2, snap.root_hash, "loaded root hash mismatch");
     assert_eq!(height2, snap.tree_height as usize, "loaded height mismatch");
+}
+
+// ── CacheSize ────────────────────────────────────────────────────────
+
+#[test]
+fn cache_size_bytes_returns_exact_value() {
+    let cs = CacheSize::Bytes(512 * 1024 * 1024);
+    assert_eq!(cs.resolve(), 512 * 1024 * 1024);
+}
+
+#[test]
+fn cache_size_default_is_256mb() {
+    assert_eq!(CacheSize::default().resolve(), 256 * 1024 * 1024);
+}
+
+#[test]
+fn cache_size_percent_returns_fraction_of_ram() {
+    let half = CacheSize::Percent(0.5);
+    let resolved = half.resolve();
+    // On any machine running these tests, half of RAM should be >128MB.
+    assert!(resolved > 128 * 1024 * 1024, "half of RAM unexpectedly small: {resolved}");
+    // And less than 1TB, just to catch parse failures returning garbage.
+    assert!(resolved < 1024 * 1024 * 1024 * 1024, "half of RAM unexpectedly large: {resolved}");
 }

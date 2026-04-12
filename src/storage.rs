@@ -44,6 +44,49 @@ pub struct SnapshotDump {
     pub chunks: Vec<([u8; 32], Vec<u8>)>,
 }
 
+/// Redb page cache size configuration.
+pub enum CacheSize {
+    /// Fixed size in bytes.
+    Bytes(usize),
+    /// Fraction of total system memory (0.0–1.0).
+    Percent(f64),
+}
+
+impl Default for CacheSize {
+    fn default() -> Self {
+        CacheSize::Bytes(256 * 1024 * 1024)
+    }
+}
+
+impl CacheSize {
+    /// Resolve to a concrete byte count.
+    ///
+    /// For `Percent`, reads `/proc/meminfo` to detect total RAM.
+    /// Falls back to 256 MB if system memory cannot be determined.
+    pub fn resolve(&self) -> usize {
+        match self {
+            CacheSize::Bytes(b) => *b,
+            CacheSize::Percent(p) => {
+                let total = read_memtotal().unwrap_or(256 * 1024 * 1024);
+                (total as f64 * p.clamp(0.0, 1.0)) as usize
+            }
+        }
+    }
+}
+
+/// Read MemTotal from `/proc/meminfo`.  Returns total RAM in bytes.
+fn read_memtotal() -> Option<usize> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb_str = rest.trim().strip_suffix("kB")?.trim();
+            let kb: usize = kb_str.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
 /// Persistent, versioned, crash-safe AVL+ authenticated dictionary over redb.
 pub struct RedbAVLStorage {
     db: Arc<Database>,
@@ -56,9 +99,14 @@ pub struct RedbAVLStorage {
 
 impl RedbAVLStorage {
     /// Open or create state storage at `path`.
-    pub fn open(path: &Path, tree_params: AVLTreeParams, keep_versions: u32) -> Result<Self> {
+    pub fn open(
+        path: &Path,
+        tree_params: AVLTreeParams,
+        keep_versions: u32,
+        cache_size: CacheSize,
+    ) -> Result<Self> {
         let db = Database::builder()
-            .set_cache_size(256 * 1024 * 1024)
+            .set_cache_size(cache_size.resolve())
             .create(path)
             .context("failed to create/open redb")?;
 
