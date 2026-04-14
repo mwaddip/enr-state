@@ -370,6 +370,27 @@ impl RedbAVLStorage {
 
         Ok(())
     }
+
+    /// Force a durable commit — fsync all pending writes to disk.
+    ///
+    /// `update()` uses `Durability::None` so normal commits skip fsync and
+    /// batch through the OS page cache.  Without an fsync, the redb commit
+    /// pointer is not guaranteed to be on disk when the process exits — a
+    /// SIGTERM that skips destructors can leave the database appearing
+    /// empty on reopen.  Call this periodically during long-running writes
+    /// (e.g. every N blocks in the sync loop) and on graceful shutdown to
+    /// bound worst-case data loss to the interval between flushes.
+    ///
+    /// Implemented as an empty write transaction committed with
+    /// `Durability::Immediate`.  A redb commit with Immediate durability
+    /// fsyncs all outstanding data and the metadata pointer, including
+    /// prior `Durability::None` commits still held in the page cache.
+    pub fn flush(&self) -> Result<()> {
+        let mut write_txn = self.db.begin_write()?;
+        write_txn.set_durability(Durability::Immediate)?;
+        write_txn.commit().context("flush commit failed")?;
+        Ok(())
+    }
 }
 
 // ── SnapshotReader ───────────────────────────────────────────────────

@@ -395,6 +395,90 @@ fn reopen_preserves_rollback_chain() {
     assert_eq!(prover.digest().unwrap(), d1);
 }
 
+// ── flush() ──────────────────────────────────────────────────────────
+
+#[test]
+fn flush_persists_state_across_reopen() {
+    // After an update() (Durability::None) followed by flush() and drop,
+    // the state must be recoverable on reopen.  This is the main node's
+    // guarantee on graceful shutdown.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("state.redb");
+
+    let expected_version;
+    {
+        let mut storage =
+            RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+        let resolver = storage.resolver();
+        let tree = AVLTree::new(resolver, KEY_LEN, None);
+        let mut prover = BatchAVLProver::new(tree, true);
+
+        prover
+            .perform_one_operation(&Operation::Insert(KeyValue {
+                key: make_key(90),
+                value: make_value(90, 64),
+            }))
+            .unwrap();
+        storage.update(&mut prover, vec![]).unwrap();
+        expected_version = storage.version().unwrap();
+
+        // Force a durable commit before the storage goes out of scope.
+        storage.flush().unwrap();
+    }
+
+    let storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+    assert_eq!(storage.version().unwrap(), expected_version);
+}
+
+#[test]
+fn flush_between_updates_is_transparent() {
+    // Calling flush() between updates must not interfere with subsequent
+    // writes or the in-memory version chain.
+    let (mut storage, mut prover, _dir) = setup(10);
+    let v1 = storage.version().unwrap();
+
+    storage.flush().unwrap();
+    assert_eq!(storage.version().unwrap(), v1);
+
+    prover.base.tree.reset();
+    prover.base.changed_nodes_buffer.clear();
+    prover.base.changed_nodes_buffer_to_check.clear();
+
+    prover
+        .perform_one_operation(&Operation::Insert(KeyValue {
+            key: make_key(91),
+            value: make_value(91, 64),
+        }))
+        .unwrap();
+    storage.update(&mut prover, vec![]).unwrap();
+
+    let v2 = storage.version().unwrap();
+    assert_ne!(v1, v2);
+
+    storage.flush().unwrap();
+    assert_eq!(storage.version().unwrap(), v2);
+}
+
+#[test]
+fn flush_is_idempotent() {
+    // Back-to-back flushes must all succeed — no-op after the first.
+    let (storage, _, _dir) = setup(10);
+    storage.flush().unwrap();
+    storage.flush().unwrap();
+    storage.flush().unwrap();
+}
+
+#[test]
+fn flush_on_empty_storage_succeeds() {
+    // Flush on a freshly opened storage with no updates must not error.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("state.redb");
+    let storage =
+        RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+    assert!(storage.version().is_none());
+    storage.flush().unwrap();
+}
+
 // ── Snapshot dump ────────────────────────────────────────────────────
 
 /// Compute a node label from its packed bytes, matching ergo_avltree_rust convention.
