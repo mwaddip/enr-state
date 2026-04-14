@@ -874,4 +874,8 @@ impl VersionedAVLStorage for RedbAVLStorage {
                 .map(|(_, digest)| digest.clone()),
         )
     }
+
+    fn flush(&self) -> Result<()> {
+        RedbAVLStorage::flush(self)
+    }
 }
