@@ -122,6 +122,30 @@ impl RedbAVLStorage {
         let db = Arc::new(db);
         let (current_version, version_chain) = Self::restore_state(&db)?;
 
+        // One-shot migration for storage written before META_BLOCK_HEIGHT
+        // existed.  Contract: block_height().is_some() == version().is_some().
+        // A legacy file has version but no block_height key; fix that here
+        // so callers never see the invariant violated.  Legacy data has no
+        // real block_height to recover — caller must fall back to
+        // header-scan when it encounters Some(0) on an older file.
+        if current_version.is_some() {
+            let has_block_height = {
+                let read_txn = db.begin_read()?;
+                let meta = read_txn.open_table(META_TABLE)?;
+                meta.get(META_BLOCK_HEIGHT)?.is_some()
+            };
+            if !has_block_height {
+                warn!("state.redb predates block_height metadata — migrating to 0");
+                let mut write_txn = db.begin_write()?;
+                write_txn.set_durability(Durability::Immediate)?;
+                {
+                    let mut meta = write_txn.open_table(META_TABLE)?;
+                    meta.insert(META_BLOCK_HEIGHT, 0u32.to_be_bytes().as_slice())?;
+                }
+                write_txn.commit()?;
+            }
+        }
+
         debug!(
             version = ?current_version.as_ref().map(|v| v.len()),
             chain_len = version_chain.len(),
@@ -343,6 +367,7 @@ impl RedbAVLStorage {
         root_hash: Digest32,
         height: usize,
         version: ADDigest,
+        block_height: u32,
     ) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         {
@@ -358,6 +383,7 @@ impl RedbAVLStorage {
                 .insert(META_TOP_NODE_HEIGHT, (height as u32).to_be_bytes().as_slice())?;
             meta_table.insert(META_CURRENT_VERSION, version.as_ref())?;
             meta_table.insert(META_LSN, 1u64.to_be_bytes().as_slice())?;
+            meta_table.insert(META_BLOCK_HEIGHT, block_height.to_be_bytes().as_slice())?;
 
             let chain = VecDeque::from([(1u64, version.clone())]);
             let chain_bytes = Self::serialize_version_chain(&chain);
@@ -369,6 +395,35 @@ impl RedbAVLStorage {
         self.version_chain = VecDeque::from([(1, version)]);
 
         Ok(())
+    }
+
+    /// Read the caller-supplied block height last committed with the
+    /// current state version.  Returns `None` iff `version()` is `None`
+    /// (empty storage).
+    pub fn block_height(&self) -> Option<u32> {
+        let read_txn = self.db.begin_read().ok()?;
+        let meta = read_txn.open_table(META_TABLE).ok()?;
+        let guard = meta.get(META_BLOCK_HEIGHT).ok()??;
+        let bytes: &[u8] = guard.value();
+        bytes.try_into().ok().map(u32::from_be_bytes)
+    }
+
+    /// Atomically persist tree changes and the caller-supplied block
+    /// height.  Identical to the trait `update()` but with block_height
+    /// written in the same redb transaction as the state nodes,
+    /// metadata, and undo record.
+    ///
+    /// Call this from block-applying code where the caller knows which
+    /// block produced this state root.  On resume after crash, retrieve
+    /// it via `block_height()` — the storage knows exactly which block
+    /// it is at, no header scan required.
+    pub fn update_with_height(
+        &mut self,
+        prover: &mut BatchAVLProver,
+        additional_data: Vec<(ADKey, ADValue)>,
+        block_height: u32,
+    ) -> Result<()> {
+        self.update_internal(prover, additional_data, Some(block_height))
     }
 
     /// Force a durable commit — fsync all pending writes to disk.
@@ -622,13 +677,21 @@ impl SnapshotReader {
     }
 }
 
-// ── VersionedAVLStorage ───────────────────────────────────────────────
-
-impl VersionedAVLStorage for RedbAVLStorage {
-    fn update(
+impl RedbAVLStorage {
+    /// Shared implementation behind the trait `update()` and the
+    /// inherent `update_with_height()`.
+    ///
+    /// `block_height == None` ⇒ preserve whatever block height is
+    /// already in the metadata table (write it back explicitly so
+    /// block_height() never returns None for a non-empty storage).
+    /// `Some(h)` ⇒ replace it with `h`.  Either way, block_height is
+    /// committed in the same redb transaction as the state nodes and
+    /// metadata, so crash recovery can't leave them out of sync.
+    fn update_internal(
         &mut self,
         prover: &mut BatchAVLProver,
         additional_data: Vec<(ADKey, ADValue)>,
+        block_height: Option<u32>,
     ) -> Result<()> {
         // 1. Compute new digest.
         let new_digest = prover.digest().context("prover has no root")?;
@@ -674,6 +737,19 @@ impl VersionedAVLStorage for RedbAVLStorage {
             let mut nodes_table = write_txn.open_table(NODES_TABLE)?;
             let mut meta_table = write_txn.open_table(META_TABLE)?;
 
+            // Read pre-update block_height — used for the undo record and,
+            // when the caller didn't pass a new one, as the value to write
+            // back (preserves the invariant that a non-empty storage always
+            // has a block_height).
+            let prev_block_height = match meta_table.get(META_BLOCK_HEIGHT)? {
+                Some(v) => u32::from_be_bytes(
+                    v.value()
+                        .try_into()
+                        .context("corrupt META_BLOCK_HEIGHT: expected 4 bytes")?,
+                ),
+                None => 0,
+            };
+
             // Build + write undo record.
             if self.keep_versions > 0 {
                 let mut undo_table = write_txn.open_table(UNDO_TABLE)?;
@@ -714,6 +790,7 @@ impl VersionedAVLStorage for RedbAVLStorage {
                     prev_top_node_hash,
                     prev_top_node_height,
                     prev_version,
+                    prev_block_height,
                 };
                 let undo_bytes = undo.serialize();
                 undo_table.insert(new_lsn, undo_bytes.as_slice())?;
@@ -744,6 +821,8 @@ impl VersionedAVLStorage for RedbAVLStorage {
             meta_table.insert(META_TOP_NODE_HEIGHT, new_height.to_be_bytes().as_slice())?;
             meta_table.insert(META_CURRENT_VERSION, new_digest.as_ref())?;
             meta_table.insert(META_LSN, new_lsn.to_be_bytes().as_slice())?;
+            let new_block_height = block_height.unwrap_or(prev_block_height);
+            meta_table.insert(META_BLOCK_HEIGHT, new_block_height.to_be_bytes().as_slice())?;
 
             let chain_bytes = Self::serialize_version_chain(&new_chain);
             meta_table.insert(META_VERSIONS, chain_bytes.as_slice())?;
@@ -757,6 +836,18 @@ impl VersionedAVLStorage for RedbAVLStorage {
         self.version_chain = new_chain;
 
         Ok(())
+    }
+}
+
+// ── VersionedAVLStorage ───────────────────────────────────────────────
+
+impl VersionedAVLStorage for RedbAVLStorage {
+    fn update(
+        &mut self,
+        prover: &mut BatchAVLProver,
+        additional_data: Vec<(ADKey, ADValue)>,
+    ) -> Result<()> {
+        self.update_internal(prover, additional_data, None)
     }
 
     fn rollback(&mut self, version: &ADDigest) -> Result<(NodeId, usize)> {
@@ -825,6 +916,10 @@ impl VersionedAVLStorage for RedbAVLStorage {
                 undo.prev_top_node_height.to_be_bytes().as_slice(),
             )?;
             meta_table.insert(META_CURRENT_VERSION, undo.prev_version.as_ref())?;
+            meta_table.insert(
+                META_BLOCK_HEIGHT,
+                undo.prev_block_height.to_be_bytes().as_slice(),
+            )?;
 
             let (target_lsn, _) = self.version_chain[target_pos];
             meta_table.insert(META_LSN, target_lsn.to_be_bytes().as_slice())?;

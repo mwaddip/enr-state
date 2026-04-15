@@ -16,6 +16,9 @@ pub struct UndoRecord {
     pub prev_top_node_height: u32,
     /// ADDigest (version) before this update.  Empty for the first update.
     pub prev_version: Bytes,
+    /// Caller-supplied block height before this update.  0 if the storage
+    /// was empty or the caller never set one.
+    pub prev_block_height: u32,
 }
 
 impl UndoRecord {
@@ -41,6 +44,9 @@ impl UndoRecord {
         buf.extend_from_slice(&self.prev_top_node_height.to_be_bytes());
         buf.extend_from_slice(&(self.prev_version.len() as u32).to_be_bytes());
         buf.extend_from_slice(&self.prev_version);
+        // Appended in the block_height revision.  Pre-revision records
+        // stop here; deserialize treats absent trailing bytes as 0.
+        buf.extend_from_slice(&self.prev_block_height.to_be_bytes());
 
         buf
     }
@@ -96,6 +102,16 @@ impl UndoRecord {
             bail!("undo record truncated reading prev_version at offset {}", pos);
         }
         let prev_version = Bytes::copy_from_slice(&data[pos..pos + version_len]);
+        pos += version_len;
+
+        // Trailing field — present only on records written after the
+        // block_height revision.  Absent ⇒ treat as 0 (pre-revision
+        // caller didn't track block height).
+        let prev_block_height = if pos + 4 <= data.len() {
+            read_u32(&mut pos)?
+        } else {
+            0
+        };
 
         Ok(UndoRecord {
             removed_nodes,
@@ -103,6 +119,7 @@ impl UndoRecord {
             prev_top_node_hash,
             prev_top_node_height,
             prev_version,
+            prev_block_height,
         })
     }
 }

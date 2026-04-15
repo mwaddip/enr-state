@@ -304,7 +304,7 @@ fn load_snapshot_sets_state() {
 
     // Load via snapshot.
     storage
-        .load_snapshot(nodes.into_iter(), root_label, height, digest.clone())
+        .load_snapshot(nodes.into_iter(), root_label, height, digest.clone(), 0)
         .unwrap();
 
     assert_eq!(storage.version().unwrap(), digest);
@@ -656,6 +656,7 @@ fn dump_snapshot_round_trip() {
             snap.root_hash,
             snap.tree_height as usize,
             version,
+            0,
         )
         .unwrap();
 
@@ -686,4 +687,201 @@ fn cache_size_percent_returns_fraction_of_ram() {
     assert!(resolved > 128 * 1024 * 1024, "half of RAM unexpectedly small: {resolved}");
     // And less than 1TB, just to catch parse failures returning garbage.
     assert!(resolved < 1024 * 1024 * 1024 * 1024, "half of RAM unexpectedly large: {resolved}");
+}
+
+// ── block_height persistence ─────────────────────────────────────────
+
+#[test]
+fn update_persists_block_height() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("state.redb");
+    {
+        let mut storage =
+            RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+        let resolver = storage.resolver();
+        let tree = AVLTree::new(resolver, KEY_LEN, None);
+        let mut prover = BatchAVLProver::new(tree, true);
+
+        // Apply 5 updates with ascending block heights.
+        let heights = [1_000_000u32, 1_000_001, 1_000_002, 1_000_003, 1_000_004];
+        for (i, h) in heights.iter().enumerate() {
+            prover.base.tree.reset();
+            prover.base.changed_nodes_buffer.clear();
+            prover.base.changed_nodes_buffer_to_check.clear();
+
+            let seed = 100 + i as u8;
+            prover
+                .perform_one_operation(&Operation::Insert(KeyValue {
+                    key: make_key(seed),
+                    value: make_value(seed, 64),
+                }))
+                .unwrap();
+            storage.update_with_height(&mut prover, vec![], *h).unwrap();
+            assert_eq!(storage.block_height(), Some(*h));
+        }
+        storage.flush().unwrap();
+    }
+
+    // Reopen — the last value must survive.
+    let storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+    assert_eq!(storage.block_height(), Some(1_000_004));
+}
+
+#[test]
+fn rollback_restores_block_height() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("state.redb");
+    let mut storage =
+        RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+    let resolver = storage.resolver();
+    let tree = AVLTree::new(resolver, KEY_LEN, None);
+    let mut prover = BatchAVLProver::new(tree, true);
+
+    // First update at height 100.
+    prover
+        .perform_one_operation(&Operation::Insert(KeyValue {
+            key: make_key(1),
+            value: make_value(1, 64),
+        }))
+        .unwrap();
+    storage.update_with_height(&mut prover, vec![], 100).unwrap();
+    let digest_at_100 = storage.version().unwrap();
+
+    // Update at height 101.
+    prover.base.tree.reset();
+    prover.base.changed_nodes_buffer.clear();
+    prover.base.changed_nodes_buffer_to_check.clear();
+    prover
+        .perform_one_operation(&Operation::Insert(KeyValue {
+            key: make_key(2),
+            value: make_value(2, 64),
+        }))
+        .unwrap();
+    storage.update_with_height(&mut prover, vec![], 101).unwrap();
+
+    // Update at height 102.
+    prover.base.tree.reset();
+    prover.base.changed_nodes_buffer.clear();
+    prover.base.changed_nodes_buffer_to_check.clear();
+    prover
+        .perform_one_operation(&Operation::Insert(KeyValue {
+            key: make_key(3),
+            value: make_value(3, 64),
+        }))
+        .unwrap();
+    storage.update_with_height(&mut prover, vec![], 102).unwrap();
+
+    assert_eq!(storage.block_height(), Some(102));
+
+    // Rollback to the version at height 100.
+    storage.rollback(&digest_at_100).unwrap();
+    assert_eq!(storage.version().unwrap(), digest_at_100);
+    assert_eq!(storage.block_height(), Some(100));
+}
+
+#[test]
+fn load_snapshot_sets_block_height() {
+    // Build a tiny tree with a known root, then bulk-load it with
+    // block_height = 500_000.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("state.redb");
+    {
+        let mut storage =
+            RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+
+        let resolver = storage.resolver();
+        let tree = AVLTree::new(resolver, KEY_LEN, None);
+        let mut prover = BatchAVLProver::new(tree, true);
+
+        prover
+            .perform_one_operation(&Operation::Insert(KeyValue {
+                key: make_key(77),
+                value: make_value(77, 64),
+            }))
+            .unwrap();
+
+        let digest = prover.digest().unwrap();
+        let root_label = prover.base.tree.label(&prover.top_node());
+        let height = prover.base.tree.height;
+        let packed = prover.base.tree.pack(prover.top_node());
+
+        storage
+            .load_snapshot(
+                vec![(root_label, packed)].into_iter(),
+                root_label,
+                height,
+                digest,
+                500_000,
+            )
+            .unwrap();
+
+        assert_eq!(storage.block_height(), Some(500_000));
+        storage.flush().unwrap();
+    }
+
+    let storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+    assert_eq!(storage.block_height(), Some(500_000));
+}
+
+#[test]
+fn crash_simulation_preserves_pre_update_block_height() {
+    // An uncommitted write transaction against the metadata table must
+    // leave block_height at its prior committed value.  This is the
+    // atomicity guarantee — an in-flight block_height write that never
+    // commits is invisible on reopen.
+    use redb::{Database, TableDefinition};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("state.redb");
+
+    // 1. Commit block_height = 42 via the normal update path.
+    let committed_version;
+    {
+        let mut storage =
+            RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+        let resolver = storage.resolver();
+        let tree = AVLTree::new(resolver, KEY_LEN, None);
+        let mut prover = BatchAVLProver::new(tree, true);
+
+        prover
+            .perform_one_operation(&Operation::Insert(KeyValue {
+                key: make_key(1),
+                value: make_value(1, 64),
+            }))
+            .unwrap();
+        storage.update_with_height(&mut prover, vec![], 42).unwrap();
+        storage.flush().unwrap();
+        committed_version = storage.version().unwrap();
+    }
+
+    // 2. Start a raw redb write transaction that would overwrite
+    //    block_height to a bogus value, then drop WITHOUT committing.
+    //    redb must discard the uncommitted write.
+    {
+        let db = Database::builder().create(&path).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        {
+            let meta_def: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
+            let mut meta = write_txn.open_table(meta_def).unwrap();
+            meta.insert("block_height", 999_999u32.to_be_bytes().as_slice())
+                .unwrap();
+        }
+        drop(write_txn);
+    }
+
+    // 3. Reopen and verify block_height is the pre-"crash" value.
+    let storage = RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+    assert_eq!(storage.version().unwrap(), committed_version);
+    assert_eq!(storage.block_height(), Some(42));
+}
+
+#[test]
+fn block_height_is_none_on_empty_storage() {
+    // Invariant: block_height() returns None iff version() is None.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("state.redb");
+    let storage =
+        RedbAVLStorage::open(&path, params(), 10, CacheSize::default()).unwrap();
+    assert!(storage.version().is_none());
+    assert!(storage.block_height().is_none());
 }
