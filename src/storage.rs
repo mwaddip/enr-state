@@ -835,6 +835,16 @@ impl RedbAVLStorage {
         self.current_version = Some(new_digest);
         self.version_chain = new_chain;
 
+        // Reset the prover's dirty-node bookkeeping. In UTXO mode we never
+        // call generate_proof on the main prover, so without this the
+        // is_new/visited flags accumulate forever. collect_changed_nodes
+        // treats is_new|visited as "changed since last flush", so stale
+        // flags cause inserted_labels in every undo record to include the
+        // ENTIRE live tree — a single rollback then deletes everything.
+        prover.base.tree.reset();
+        prover.base.changed_nodes_buffer.clear();
+        prover.base.changed_nodes_buffer_to_check.clear();
+
         Ok(())
     }
 }
