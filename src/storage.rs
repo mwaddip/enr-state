@@ -531,7 +531,7 @@ impl SnapshotReader {
     ) -> Result<()> {
         let packed = table
             .get(label.as_slice())?
-            .with_context(|| format!("manifest: node {} not found", format!("{:02x?}", label)))?;
+            .with_context(|| format!("manifest: node {:02x?} not found", label))?;
         let packed_bytes = packed.value();
         manifest.extend_from_slice(packed_bytes);
 
@@ -568,7 +568,7 @@ impl SnapshotReader {
     ) -> Result<()> {
         let packed = table
             .get(label.as_slice())?
-            .with_context(|| format!("chunk: node {} not found", format!("{:02x?}", label)))?;
+            .with_context(|| format!("chunk: node {:02x?} not found", label))?;
         let packed_bytes = packed.value();
         buf.extend_from_slice(packed_bytes);
 
