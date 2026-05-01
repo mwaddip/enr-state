@@ -1,11 +1,12 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
@@ -72,6 +73,16 @@ impl CacheSize {
             }
         }
     }
+}
+
+/// Format a 32-byte digest as a flat lowercase hex string (64 chars).
+/// Used for grep-friendly diagnostic logging.
+fn digest_hex(label: &Digest32) -> String {
+    let mut s = String::with_capacity(64);
+    for b in label {
+        let _ = write!(&mut s, "{:02x}", b);
+    }
+    s
 }
 
 /// Read MemTotal from `/proc/meminfo`.  Returns total RAM in bytes.
@@ -749,6 +760,7 @@ impl RedbAVLStorage {
                 ),
                 None => 0,
             };
+            let new_block_height = block_height.unwrap_or(prev_block_height);
 
             // Build + write undo record.
             if self.keep_versions > 0 {
@@ -801,14 +813,48 @@ impl RedbAVLStorage {
                 }
             }
 
-            // 6. Write new/modified nodes.
+            // 6. Write new/modified nodes.  Track labels we just wrote so
+            //    the delete loop can refuse to remove them — see the
+            //    overlap guard at step 7 for the reasoning.
+            let mut written_labels: HashSet<Digest32> =
+                HashSet::with_capacity(changed_nodes.len());
             for (label, packed) in &changed_nodes {
                 nodes_table.insert(label.as_slice(), packed.as_ref())?;
+                written_labels.insert(*label);
             }
 
-            // 7. Delete removed nodes.
+            // 7. Delete removed nodes.  If a label appears in both
+            //    `removed_labels` and `changed_nodes` (a stale entry in the
+            //    prover's `changed_nodes_buffer*` whose digest matches a
+            //    freshly-written node), removing it here would silently
+            //    destroy the node we just wrote.  Subsequent traversals
+            //    would then panic in the prover with "Should never reach
+            //    this point" because a parent references a digest that's
+            //    missing from NODES_TABLE.  Skipping the delete leaves at
+            //    worst an orphan in storage (harmless: never re-referenced
+            //    if truly orphan) and protects against the v0.4.x at-tip
+            //    state corruption.
+            let mut skipped_overlapping = 0u32;
             for label in &removed_labels {
+                if written_labels.contains(label) {
+                    skipped_overlapping += 1;
+                    warn!(
+                        label = %digest_hex(label),
+                        block_height = new_block_height,
+                        "skipping deletion: digest also in changed_nodes (would destroy freshly-written node)"
+                    );
+                    continue;
+                }
                 nodes_table.remove(label.as_slice())?;
+            }
+
+            if skipped_overlapping > 0 {
+                info!(
+                    removed_labels = removed_labels.len(),
+                    skipped_overlapping,
+                    block_height = new_block_height,
+                    "update_internal completed with overlap"
+                );
             }
 
             // 8. Store additional data.
@@ -821,7 +867,6 @@ impl RedbAVLStorage {
             meta_table.insert(META_TOP_NODE_HEIGHT, new_height.to_be_bytes().as_slice())?;
             meta_table.insert(META_CURRENT_VERSION, new_digest.as_ref())?;
             meta_table.insert(META_LSN, new_lsn.to_be_bytes().as_slice())?;
-            let new_block_height = block_height.unwrap_or(prev_block_height);
             meta_table.insert(META_BLOCK_HEIGHT, new_block_height.to_be_bytes().as_slice())?;
 
             let chain_bytes = Self::serialize_version_chain(&new_chain);
