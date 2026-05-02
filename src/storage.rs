@@ -959,6 +959,7 @@ impl VersionedAVLStorage for RedbAVLStorage {
 
         let write_txn = self.db.begin_write()?;
         let mut last_undo: Option<UndoRecord> = None;
+        let mut skipped_deletions: usize = 0;
 
         {
             let mut nodes_table = write_txn.open_table(NODES_TABLE)?;
@@ -976,9 +977,16 @@ impl VersionedAVLStorage for RedbAVLStorage {
                 drop(undo_data);
 
                 // Reverse: delete nodes that were inserted.
-                for label in &undo.inserted_labels {
-                    nodes_table.remove(label.as_slice())?;
-                }
+                //
+                // SKIPPED — see contains() fix in ergo_avltree_rust commit
+                // 879545c for the symmetric forward-path fix. Deleting an
+                // inserted_label here is unsafe when that label is still
+                // referenced from either (a) the rolled-back-to state's
+                // tree, or (b) older versions still in the chain. Net
+                // effect of skipping: orphan nodes accumulate in
+                // NODES_TABLE; the tree on disk stays consistent. Periodic
+                // offline mark-and-sweep can reclaim space if needed.
+                skipped_deletions += undo.inserted_labels.len();
 
                 // Reverse: re-insert nodes that were removed.
                 for (label, packed) in &undo.removed_nodes {
@@ -1037,6 +1045,16 @@ impl VersionedAVLStorage for RedbAVLStorage {
         let tree = self.make_tree();
         let root_node = tree.unpack(&node_bytes);
 
+        let mut version_hex = String::with_capacity(version.len() * 2);
+        for b in version.as_ref() {
+            let _ = write!(&mut version_hex, "{:02x}", b);
+        }
+        info!(
+            target_version = %version_hex,
+            target_position = target_pos,
+            skipped_deletions,
+            "rollback: skipped node deletions to preserve cross-version references"
+        );
         debug!(height, "rollback complete");
         Ok((root_node, height))
     }
