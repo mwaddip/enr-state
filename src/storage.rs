@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use ergo_avltree_rust::authenticated_tree_ops::AuthenticatedTreeOps;
 use ergo_avltree_rust::batch_avl_prover::BatchAVLProver;
@@ -83,6 +83,18 @@ fn digest_hex(label: &Digest32) -> String {
         let _ = write!(&mut s, "{:02x}", b);
     }
     s
+}
+
+/// Log a resolver miss at WARN with the digest hex and a short reason tag.
+/// The digest tells us which node the prover expected but storage didn't have —
+/// grep the log for `resolver miss` after a "Should never reach this point"
+/// bail to recover the missing label and walk the tree state.
+fn log_resolver_miss(digest: &Digest32, reason: &'static str) {
+    warn!(
+        digest = %digest_hex(digest),
+        reason,
+        "resolver miss: returning LabelOnly placeholder"
+    );
 }
 
 /// Read MemTotal from `/proc/meminfo`.  Returns total RAM in bytes.
@@ -212,6 +224,7 @@ impl RedbAVLStorage {
     }
 
     /// Create a Resolver closure that reads nodes from storage on demand.
+    /// Misses log WARN with the digest hex for post-failure diagnostics.
     pub fn resolver(&self) -> Resolver {
         let db = Arc::clone(&self.db);
         let key_length = self.tree_params.key_length;
@@ -220,11 +233,19 @@ impl RedbAVLStorage {
         Arc::new(move |digest: &Digest32| {
             let read_txn = match db.begin_read() {
                 Ok(txn) => txn,
-                Err(_) => return Node::LabelOnly(NodeHeader::new(Some(*digest), None)),
+                Err(e) => {
+                    error!(error = %e, "resolver: begin_read failed");
+                    log_resolver_miss(digest, "begin_read_error");
+                    return Node::LabelOnly(NodeHeader::new(Some(*digest), None));
+                }
             };
             let table = match read_txn.open_table(NODES_TABLE) {
                 Ok(t) => t,
-                Err(_) => return Node::LabelOnly(NodeHeader::new(Some(*digest), None)),
+                Err(e) => {
+                    error!(error = %e, "resolver: open_table failed");
+                    log_resolver_miss(digest, "open_table_error");
+                    return Node::LabelOnly(NodeHeader::new(Some(*digest), None));
+                }
             };
             match table.get(digest.as_slice()) {
                 Ok(Some(data)) => {
@@ -235,7 +256,15 @@ impl RedbAVLStorage {
                     let node = node_id.borrow().clone();
                     node
                 }
-                _ => Node::LabelOnly(NodeHeader::new(Some(*digest), None)),
+                Ok(None) => {
+                    log_resolver_miss(digest, "not_in_storage");
+                    Node::LabelOnly(NodeHeader::new(Some(*digest), None))
+                }
+                Err(e) => {
+                    error!(error = %e, "resolver: table.get failed");
+                    log_resolver_miss(digest, "table_get_error");
+                    Node::LabelOnly(NodeHeader::new(Some(*digest), None))
+                }
             }
         })
     }
